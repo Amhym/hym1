@@ -4,6 +4,7 @@
 
 using namespace std;
 
+//功能测试宏:
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,12 +18,15 @@ using namespace std;
 #include <assert.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <signal.h>
+#include <signal.h>//信号用作进程间通信
 #include <dirent.h>
 #include <sys/wait.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <sys/epoll.h>
+#include <map>
+#include "threadpool.h"
 
 // #define PORT          8080     /* Server port */
 #define HEADER_SIZE   10240L /* Maximum size of a request header line */
@@ -54,6 +58,12 @@ using namespace std;
 // #define PAGES_DIRECTORY "htdocs"
 #define VERSION_STRING  "klange/0.5"
 
+// epoll max_num
+#define OPEN_MAX 1024
+
+//epoll tree root
+int efd;
+
 /*
  * Incoming request socket data
  */
@@ -63,6 +73,7 @@ struct socket_request {
 	struct sockaddr_in address;  /* Remote address */
 	pthread_t          thread;   /* Handler thread */
 };
+map<int,socket_request*> mp;
 
 /*
  * CGI process data
@@ -84,7 +95,8 @@ int serversock;
 int port;
 // char* docs;
 string docs;
-
+//是否使用线程池
+bool has_pool=false;
 
 /*
  * Last unaccepted socket pointer
@@ -104,6 +116,7 @@ void handleShutdown(int sig) {
 	 */
 	shutdown(serversock, SHUT_RDWR);
 	close(serversock);
+	// cout<<serversock<<"关闭"<<endl;
 
 	/*
 	 * Free the thread data block
@@ -143,6 +156,7 @@ void free_vector(vector_t* v) {
 }
 
 void vector_append(vector_t * v, void * item) {
+	//如果向量内存不够了，就拓展为原来的两倍
 	if(v->size == v->alloc_size) {
 		v->alloc_size = v->alloc_size * 2;
 		v->buffer = (void **) realloc(v->buffer, v->alloc_size * sizeof(void *));
@@ -186,6 +200,8 @@ void generic_response(FILE * socket_stream, char * status, char * message) {
 			"Server: " VERSION_STRING "\r\n"
 			"Content-Type: text/plain\r\n"
 			"Content-Length: %zu\r\n"
+			// "Connection: Keep-Alive\r\n"
+			// "Keep-Alive: max=5, timeout=120\r\n"
 			"\r\n"
 			"%s\r\n", status, strlen(message), message);
 }
@@ -228,7 +244,7 @@ void *handleRequest(void *socket) {
 	FILE *socket_stream = NULL;
 	socket_stream = fdopen(request->fd, "r+");
 	if (!socket_stream) {
-		fprintf(stderr,"Ran out of a file descriptors, can not respond to request.\n");
+		// fprintf(stderr,"Ran out of a file descriptors, can not respond to request.\n");
 		goto _disconnect;
 	};
 
@@ -238,11 +254,13 @@ void *handleRequest(void *socket) {
 	while (1) {
 		vector_t * queue = alloc_vector();
 		char buf[HEADER_SIZE];
+		//feof()测试给定流 socket_stream 的文件结束标识符,当设置了与流关联的文件结束标识符时，该函数返回一个非零值，否则返回零。判断连接是否断开
 		while (!feof(socket_stream)) {
 			/*
 			 * While the client has not yet disconnected,
 			 * read request headers into the queue.
 			 */
+			//这个字符数组的长度是HEADER_SIZE - 1，最后一位已经默认是'\0',加上换行符就-2
 			char * in = fgets( buf, HEADER_SIZE - 2, socket_stream );
 
 			if (!in) {
@@ -279,6 +297,8 @@ void *handleRequest(void *socket) {
 			/*
 			 * End of stream -> Client closed connection.
 			 */
+
+			// cout<<"Client closed connection,queue deleted."<<endl;
 			delete_vector(queue);
 			break;
 		}
@@ -309,7 +329,9 @@ void *handleRequest(void *socket) {
 			/*
 			 * Find the colon for a header
 			 */
+			//cout<<"str是vector_at(queue,"<<i<<")------"<<str<<endl;
 			char * colon = strstr(str,": ");
+			
 			if (!colon) {
 				if (i > 0) {
 					/*
@@ -505,6 +527,7 @@ _unsupported:
 		_filename = (char*)calloc(sizeof(char) * (strlen(docs.c_str()) + strlen(filename) + 2), 1);
 		strcat(_filename, docs.c_str());
 		strcat(_filename, filename);
+		cout<<_filename<<"-----"<<filename<<endl;//htdocs/big.jpg-----/big.jpg
 		if (strstr(_filename, "%")) {
 			/*
 			 * Convert from URL encoded string.
@@ -582,7 +605,7 @@ _unsupported:
 				/*
 				 * Check for default indexes.
 				 */
-				struct stat extra_stats;
+				struct stat extra_stats;//获取文件信息，成功：0，失败：1；
 				char* index_php=NULL;
 				index_php=(char*)malloc(strlen(_filename) + 30);
 
@@ -598,10 +621,13 @@ _unsupported:
 					index_php[0] = '\0';
 					strcat(index_php, _filename);
 					strcat(index_php, index_defaults[index]);
+					//cout<<index_php<<"====="<<index_defaults[index]<<"===="<<index_executes[index]<<"===="<<extra_stats.st_mode<<"===="<<S_IXOTH<<endl;
 					if ((stat(index_php, &extra_stats) == 0) && ((extra_stats.st_mode & S_IXOTH) == index_executes[index])) {
+						//S_IXOTH:其他用户具可执行权限,st_mode成员，该成员描述了文件的类型和权限两个属性
 						/*
 						 * This index exists, use it instead of the directory listing.
 						 */
+						//cout<<"index:================="<<index<<endl;
 						_filename = (char*)realloc(_filename, strlen(index_php)+1);
 						stats = extra_stats;
 						memcpy(_filename, index_php, strlen(index_php)+1);
@@ -742,7 +768,7 @@ _use_file:
 						/*
 						 * Set pipes
 						 */
-						dup2(cgi_pipe_r[0],STDIN_FILENO);
+						dup2(cgi_pipe_r[0],STDIN_FILENO);//重定向
 						dup2(cgi_pipe_w[1],STDOUT_FILENO);
 						/*
 						 * This is actually cheating on my pipe.
@@ -785,7 +811,7 @@ _use_file:
 						 * SERVER_PROTOCOL   : The HTTP version of the request
 						 * SERVER_SOFTWARE   : Our application name and version
 						 */
-						setenv("SERVER_SOFTWARE", VERSION_STRING, 1);
+						setenv("SERVER_SOFTWARE", VERSION_STRING, 1);//setenv()增加或者修改环境变量
 						if (!host) {
 							char hostname[1024];
 							hostname[1023]='\0';
@@ -808,7 +834,7 @@ _use_file:
 							setenv("REQUEST_METHOD", "POST", 1); 
 						} else if (request_type == 3) {
 							setenv("REQUEST_METHOD", "HEAD", 1);
-						}
+						}//三种请求方式
 						if (querystring) {
 							if (strlen(querystring)) {
 								setenv("QUERY_STRING", querystring, 1);
@@ -868,7 +894,12 @@ _use_file:
 						delete_vector(queue);
 						free(dir);
 						free(_last_unaccepted);
-						pthread_detach(request->thread);
+						if(has_pool){
+
+						}else{
+							pthread_detach(request->thread);
+						}
+						// pthread_detach(request->thread);
 						free(request);
 
 						/*
@@ -887,7 +918,12 @@ _use_file:
 					cgi_w->fd  = cgi_pipe_w[1];
 					cgi_w->fd2 = cgi_pipe_r[0];
 					pthread_t _waitthread;
-					pthread_create(&_waitthread, NULL, wait_pid, (void *)(cgi_w));
+					if(has_pool){
+						threadpool_add_task(NULL, wait_pid, (void *)cgi_w);
+					}else{
+						pthread_create(&_waitthread, NULL, wait_pid, (void *)(cgi_w));
+					}
+					// pthread_create(&_waitthread, NULL, wait_pid, (void *)(cgi_w));
 
 					/*
 					 * Open our end of the pipes.
@@ -935,7 +971,12 @@ _use_file:
 					char buf[CGI_BUFFER];
 					if (!cgi_pipe) {
 						generic_response(socket_stream, (char *)"500 Internal Server Error", (char *)"Failed to execute CGI script.");
-						pthread_detach(_waitthread);
+						if(has_pool){
+
+						}else{
+							pthread_detach(_waitthread);
+						}
+						// pthread_detach(_waitthread);
 						goto _next;
 					}
 					fprintf(socket_stream, "HTTP/1.1 200 OK\r\n");
@@ -981,7 +1022,12 @@ _use_file:
 						 * On a HEAD request, we're done here.
 						 */
 						fprintf(socket_stream, "\r\n");
-						pthread_detach(_waitthread);
+						if(has_pool){
+
+						}else{
+							pthread_detach(_waitthread);
+						}
+						// pthread_detach(_waitthread);
 						goto _next;
 					}
 
@@ -1043,7 +1089,12 @@ _use_file:
 					/*
 					 * Release memory for the waiting thread.
 					 */
-					pthread_detach(_waitthread);
+					if(has_pool){
+						
+					}else{
+						pthread_detach(_waitthread);
+					}
+					// pthread_detach(_waitthread);
 					if (cgi_pipe) {
 						/*
 						 * If we need to, close this pipe as well.
@@ -1165,18 +1216,26 @@ _disconnect:
 	/*
 	 * Disconnect.
 	 */
+	int res=epoll_ctl(efd, EPOLL_CTL_DEL, request->fd, NULL);
+	if (res == 0)
+		cout<<"EPOLL_CTL_DEL request->fd "<<request->fd<<"成功！"<<endl;
 	if (socket_stream) {
 		fclose(socket_stream);
 	}
-	shutdown(request->fd, 2);
-
+	shutdown(request->fd, 2);//关闭request->fd的读写功能
+	// cout<<"ret:"<<ret<<endl;
 	/*
 	 * Clean up the thread
 	 */
 	if (request->thread) {
-		pthread_detach(request->thread);
+		if(has_pool){
+
+		}else{
+			pthread_detach(request->thread);
+		}
+		// pthread_detach(request->thread);
 	}
-	free(request);
+	// free(request);
 
 	/*
 	 * pthread_exit is implicit when we return...
@@ -1184,11 +1243,17 @@ _disconnect:
 	return NULL;
 }
 
-void start_httpd(unsigned short port, string doc_root)
+void start_httpd(unsigned short port, string doc_root,int poolnum)
 {
 	cerr << "Starting server (port: " << port <<
 		", doc_root: " << doc_root << ")" << endl;
 	docs=doc_root.c_str();
+	//创建线程池，池里最小poolnum个线程，最大100，队列最大100
+	if(poolnum!=0){
+		threadpool_create(poolnum,100,100);
+		has_pool=true;
+	}
+
 	/*
 	 * Initialize the TCP socket
 	 */
@@ -1236,27 +1301,80 @@ void start_httpd(unsigned short port, string doc_root)
 	/*
 	 * Use our shutdown handler.
 	 */
-	signal(SIGINT, handleShutdown);
+	signal(SIGINT, handleShutdown);//(Signal Interrupt) 中断信号，如 ctrl-C
 
 	/*
 	 * Ignore SIGPIPEs so we can do unsafe writes
 	 */
-	signal(SIGPIPE, SIG_IGN);
-
+	signal(SIGPIPE, SIG_IGN);//当服务器close一个连接时，若client端接着发数据。根据TCP协议的规定，会收到一个RST响应，client再往这个服务器发送数据时，系统会发出一个SIGPIPE信号给进程，告诉进程这个连接已经断开了，不要再写了。
+	//根据信号的默认处理规则SIGPIPE信号的默认执行动作是terminate(终止、退出),所以client会退出。若不想客户端退出可以把SIGPIPE设为SIG_IGN 这时SIGPIPE交给了系统处理。
 	/*
 	 * Start accepting connections
 	 */
+
+	// Extension 4:epoll
+	int nready, res,i, connfd,sockfd;
+	
+	struct epoll_event tep, ep[OPEN_MAX];
+	efd = epoll_create(OPEN_MAX);  //edf:监听红黑树的树根
+	if (efd == -1)
+		perror("epoll_create");
+	//把serversock添加到红黑树上
+	tep.events = EPOLLIN; 
+	tep.data.fd = serversock;
+	res = epoll_ctl(efd, EPOLL_CTL_ADD, serversock, &tep);
+	if (res == -1)
+		perror("epoll_ctl");
+	
 	while (1) {
 		/*
 		 * Accept an incoming connection and pass it on to a new thread.
 		 */
-		unsigned int c_len;
-		struct socket_request * incoming = (socket_request *)calloc(sizeof(struct socket_request),1);
-		c_len = sizeof(incoming->address);
-		_last_unaccepted = (void *)incoming;
-		incoming->fd = accept(serversock, (struct sockaddr *) &(incoming->address), &c_len);
-		_last_unaccepted = NULL;
-		pthread_create(&(incoming->thread), NULL, handleRequest, (void *)(incoming));
+		nready = epoll_wait(efd, ep, OPEN_MAX, -1); /* 阻塞监听 */
+		// cout<<"nready:"<<nready<<endl;
+		if (nready == -1)
+			perror("epoll_wait");
+		for(i=0;i<nready;i++){
+			if(!(ep[i].events & EPOLLIN))
+				continue;//如果不是读事件就继续下一个
+			if(ep[i].data.fd == serversock){
+				// serversock满足读事件，有新的客户端发起请求
+				unsigned int c_len;
+				struct socket_request * incoming = (socket_request *)calloc(sizeof(struct socket_request),1);
+				c_len = sizeof(incoming->address);
+				_last_unaccepted = (void *)incoming;
+				incoming->fd = accept(serversock, (struct sockaddr *) &(incoming->address), &c_len);
+
+				connfd = incoming->fd;//备份
+				tep.events = EPOLLIN; 
+				tep.data.fd = connfd;
+				res = epoll_ctl(efd, EPOLL_CTL_ADD, connfd, &tep);
+				mp[connfd] = incoming;
+				if (res == -1)
+					perror("epoll_ctl");
+				if (res == 0)
+					cout<<"EPOLL_CTL_ADD connfd "<<connfd<<"成功！"<<endl;
+			}else{
+				//clientfd们满足读事件
+				sockfd = ep[i].data.fd;
+				struct socket_request* incoming = mp[sockfd];
+				_last_unaccepted = NULL; 
+				if(has_pool){
+					threadpool_add_task(NULL, handleRequest, (void *)incoming);
+				}else{
+					pthread_create(&(incoming->thread), NULL, handleRequest, (void *)(incoming));
+				}
+			
+			}
+		}
+
+		// unsigned int c_len;
+		// struct socket_request * incoming = (socket_request *)calloc(sizeof(struct socket_request),1);
+		// c_len = sizeof(incoming->address);
+		// _last_unaccepted = (void *)incoming;
+		// incoming->fd = accept(serversock, (struct sockaddr *) &(incoming->address), &c_len);
+		// _last_unaccepted = NULL;
+		// pthread_create(&(incoming->thread), NULL, handleRequest, (void *)(incoming));
 	}
 
 	/*

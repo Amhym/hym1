@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>表单</title>
+</head>
+<script type="text/javascript">
+    function formSubmit(){
+        document.getElementById("myForm").submit()
+    }
+</script>
+<body>
+
+<!--
+表单form
+action：表单提交的位置，可以是网站，也可以是一个请求处理地址
+method：post，get提交方式
+get方式能在目标地址看到提交的信息，不安全，但是高效
+post方式比较安全，可以传输大文件
+-->
+<form id="myForm" action="post.cgi" method="post">
+
+<!--
+<input type="text">是文本输入框
+-->
+  <p>学号：<input type="text" name="id"></p>
+
+<!--
+<input type="password">是密码输入框，默认是用小黑点表示密码的
+-->
+  <p>姓名：<input type="text" name="username"></p>
+    
+<!--
+将input标签的type改为submit即可生成一个提交按钮
+改为reset即可将该表单内的输入框内容清空
+-->
+  <p>
+    <input type="submit">
+    <input type="reset">
+  </p>
+
+</form>
+
+</body>
+</html>
